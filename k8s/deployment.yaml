@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: agentic-cicd-gate
-          image: ybhavithr/agentic-cicd-gate:manual-test
+          image: ybhavithr/agentic-cicd-gate:5bf37e38f175a20317b80041cccac62ac54ddbd3
           ports:
             - containerPort: 8000
           readinessProbe:
