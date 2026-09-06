@@ -6,7 +6,7 @@ on:
     paths:
       - 'app/**'
       - 'Dockerfile'
-      
+
 permissions:
   contents: write
 
@@ -73,6 +73,15 @@ jobs:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+          
+      - name: Sync with latest main branch
+        run: |
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
 
       - name: Update image tag in manifest
         run: |
