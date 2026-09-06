@@ -5,7 +5,7 @@ app = FastAPI()
 
 @app.get("/")
 def root():
-    return {"message": "Hello from agentic-cicd-gate --Bhavith Reddy", "version": os.getenv("APP_VERSION", "dev")}
+    return {"message": "Hello from agentic-cicd-gate ---Bhavith Reddy", "version": os.getenv("APP_VERSION", "dev")}
 
 @app.get("/health")
 def health():
