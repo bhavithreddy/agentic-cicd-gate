@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentic-cicd-gate
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentic-cicd-gate
+  template:
+    metadata:
+      labels:
+        app: agentic-cicd-gate
+    spec:
+      containers:
+        - name: agentic-cicd-gate
+          image: ybhavithr/agentic-cicd-gate:manual-test
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentic-cicd-gate
+  namespace: default
+spec:
+  selector:
+    app: agentic-cicd-gate
+  ports:
+    - port: 80
+      targetPort: 8000
+      nodePort: 30080
+  type: NodePort
