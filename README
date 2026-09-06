@@ -1,0 +1,159 @@
+# Agentic CI/CD: Kubernetes Deployment Gate with Elastic MCP Server
+
+A CI/CD pipeline that blocks a Kubernetes deployment automatically when cluster
+resource usage is unhealthy — using an AI agent (Elastic Agent Builder) exposed
+over MCP as the health-check gate, instead of static scripted checks.
+
+Built entirely on free-tier tooling: a local Kind cluster, a self-hosted GitHub
+Actions runner, and an Elastic Cloud free trial project.
+
+## Architecture
+
+```
+ GitHub push
+      │
+      ▼
+ [build-and-push]  (GitHub-hosted runner)
+   - build Docker image, tag with commit SHA
+   - push to Docker Hub
+      │
+      ▼
+ [k8s-health-gate]  (self-hosted runner)
+   - calls Elastic Agent Builder tool `k8s_node_health_check` via MCP
+   - tool runs an ES|QL query against live OTel metrics in Elasticsearch
+   - parses memory_usage_pct, compares to threshold (80%)
+   - exits 1 (blocks pipeline) if unhealthy
+      │  (only if gate passes)
+      ▼
+ [deploy]  (self-hosted runner)
+   - updates image tag in k8s/deployment.yaml
+   - commits + pushes to git
+      │
+      ▼
+ ArgoCD (auto-sync, in-cluster) reconciles the Kind cluster
+```
+
+Data path for the gate itself:
+
+```
+Kind cluster → OTel Collector (kubeletstats receiver, daemonset)
+            → OTLP export → Elastic Cloud (Elasticsearch project)
+            → ES|QL query → Agent Builder Tool → exposed via MCP
+            → called by GitHub Actions step
+```
+
+## Stack
+
+| Component | Choice | Why |
+|---|---|---|
+| Kubernetes cluster | Kind (local) | Zero cost vs. EKS's continuous control-plane charge |
+| GitOps / deploy | ArgoCD | Real automated sync from git, not a scripted `kubectl apply` |
+| Metrics collection | OpenTelemetry Operator + Collector (daemonset, `kubeletstats` receiver) | Standard OTel path to Elastic |
+| Observability backend | Elastic Cloud (free trial, general "Elasticsearch" project type) | Free Agent Builder execution quota (1,000/mo on this project type) |
+| Health-check logic | ES|QL query wrapped as an Agent Builder Tool | Reusable, testable independent of the agent |
+| Agent | Agent Builder Agent (`kubernetes_analysis_agent`) | Demonstrates the "agentic" pattern conversationally |
+| Exposure | Elastic's built-in MCP server | Lets any MCP client (GitHub Actions here) call the tool |
+| CI/CD | GitHub Actions (hybrid: cloud + self-hosted runner) | Self-hosted leg needed to reach a local cluster + push git commits |
+| Sample app | Minimal FastAPI service (`/`, `/health`) | The app being deployed is intentionally not the focus |
+
+## Repo layout
+
+```
+agentic-cicd-gate/
+├── app/
+│   ├── main.py              # FastAPI app: / and /health
+│   └── requirements.txt
+├── Dockerfile
+├── k8s/
+│   └── deployment.yaml      # Deployment + NodePort Service (ArgoCD watches this path)
+└── .github/
+    └── workflows/
+        └── deploy.yaml      # build-and-push → k8s-health-gate → deploy
+```
+
+## How the health gate works
+
+1. An OTel Collector daemonset scrapes kubelet stats (`k8s.node.cpu.usage`,
+   `k8s.node.memory.usage/available/working_set`) every 20s and exports them
+   via OTLP to Elastic.
+2. An ES|QL query aggregates per-node averages and computes
+   `memory_usage_pct = working_set / (working_set + available) * 100`.
+3. That query is registered as an Agent Builder **Tool** (`k8s_node_health_check`),
+   independently testable in Kibana.
+4. An **Agent** (`kubernetes_analysis_agent`) wraps the tool with a system prompt
+   for conversational use (tested manually — both pass and fail thresholds verified).
+5. For the actual CI/CD gate, GitHub Actions calls the **tool directly** over
+   MCP (`tools/call`), not the agent's chat — this returns clean structured
+   JSON instead of prose, so the pass/fail decision in the workflow is
+   deterministic (`jq` + `bc`, threshold = 80% memory).
+6. A failing check calls `exit 1`, which stops the GitHub Actions job — the
+   `deploy` job (which depends on the gate job) never runs.
+
+## Key setup notes / gotchas hit during the build
+
+- **MCP requires an explicit `Accept` header.** Elastic's MCP endpoint returns
+  `406 Not Acceptable` without `Accept: application/json, text/event-stream`
+  on every request.
+- **MCP tool responses are double-encoded JSON.** The top-level
+  `result.content[0].text` field is itself a JSON string — parse it twice
+  (`jq -r '.result.content[0].text' | jq ...`).
+- **No `k8s.node.cpu.utilization` field.** Only raw `k8s.node.cpu.usage`
+  (fractional cores) is emitted — there's no ready-made percentage, so the
+  gate uses memory % as the hard threshold and reports CPU cores as
+  informational context only.
+- **GitHub-hosted runners can't reach a local cluster.** Solved with a
+  self-hosted runner registered against the repo, running on the same
+  machine as the Kind cluster.
+- **`jq` and `bc` aren't preinstalled** on a fresh self-hosted runner —
+  install them on the host before the workflow can parse/compare the
+  MCP response.
+
+## Required GitHub repo secrets
+
+| Secret | Value |
+|---|---|
+| `DOCKERHUB_USERNAME` | Docker Hub username |
+| `DOCKERHUB_TOKEN` | Docker Hub access token (not your account password) |
+| `ELASTIC_MCP_ENDPOINT` | `https://<project>.kb.<region>.<provider>.elastic.cloud/api/agent_builder/mcp` |
+| `ELASTIC_MCP_API_KEY` | Elastic API key scoped for MCP access |
+
+## Local setup summary
+
+```bash
+# 1. Local cluster
+kind create cluster --config kind-config.yaml
+
+# 2. ArgoCD
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# 3. OTel Operator + Collector (see otel-rbac.yaml, otel-collector.yaml)
+helm install opentelemetry-operator open-telemetry/opentelemetry-operator \
+  -n opentelemetry-operator-system --create-namespace
+kubectl apply -f otel-rbac.yaml
+kubectl apply -f otel-collector.yaml
+
+# 4. ArgoCD Application
+kubectl apply -f argocd-app.yaml
+
+# 5. Self-hosted GitHub Actions runner
+cd actions-runner && ./run.sh
+```
+
+## Result
+
+A push to `main` that touches `app/**` or `Dockerfile` triggers: build → push
+to Docker Hub → live cluster health check via an AI agent's tool over MCP →
+(if healthy) an automatic GitOps deploy through ArgoCD. Verified working
+end-to-end, including a deliberate low-threshold test that correctly blocked
+a deployment.
+
+## Teardown
+
+```bash
+kind delete cluster --name agentic-cicd
+```
+
+Delete the Elastic Cloud project from the Kibana project dropdown → **Manage
+this project** → **Delete project**. Remove the self-hosted runner via repo
+**Settings → Actions → Runners**, and revoke the Docker Hub access token.
